@@ -88,6 +88,112 @@ for device in api.get_devices():
     
 ```
 
+## Publishing to HomeAPI (systemd service)
+`owlet-homeapi` is a small daemon that polls the Owlet Smart Sock and stores every reading in a [HomeAPI](https://github.com/chinmay28/HomeAPI) server on your local network. It is meant to run as a systemd service on a Raspberry Pi that sits on the same LAN as HomeAPI.
+
+### One line install
+```bash
+curl -fsSL https://raw.githubusercontent.com/chinmay28/owlet/master/deploy/install.sh | sudo OWLET_EMAIL=you@example.org OWLET_PASSWORD='your-password' HOMEAPI_URL=http://homeapi.local:9999 bash
+```
+
+That single command installs the prerequisites (`git`, `python3`, `python3-venv`), creates a dedicated `owlet` system user, installs this package into a virtualenv under `/opt/owlet-homeapi`, writes `/etc/owlet-homeapi/owlet-homeapi.env`, and enables plus starts the `owlet-homeapi` service. Readings start flowing into HomeAPI every 2 seconds.
+
+Re-running the **same** command upgrades an existing install in place and keeps your configuration - values already in the environment file are preserved, only the variables you pass on the command line are updated.
+
+You can also install without credentials and fill them in afterwards:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chinmay28/owlet/master/deploy/install.sh | sudo bash
+sudo nano /etc/owlet-homeapi/owlet-homeapi.env   # add OWLET_EMAIL and OWLET_PASSWORD
+sudo systemctl start owlet-homeapi
+```
+
+Common operations after install:
+
+```bash
+systemctl status owlet-homeapi          # service status
+journalctl -u owlet-homeapi -f          # live logs
+sudo systemctl restart owlet-homeapi    # restart, e.g. after editing the config
+```
+
+To remove it again (add `--purge` to also drop the config and the service user):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chinmay28/owlet/master/deploy/uninstall.sh | sudo bash
+```
+
+### Configuration
+All settings live in `/etc/owlet-homeapi/owlet-homeapi.env` (mode `0640`, readable by the service user only). Every one of them can also be passed to the installer, as shown above. See [`deploy/owlet-homeapi.env.example`](deploy/owlet-homeapi.env.example) for an annotated copy.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `OWLET_EMAIL` | - | Owlet account email address (required) |
+| `OWLET_PASSWORD` | - | Owlet account password (required) |
+| `OWLET_POLL_INTERVAL` | `2` | Seconds between readings |
+| `OWLET_REACTIVATE_INTERVAL` | `10` | Seconds between re-arming the Owlet data stream |
+| `OWLET_DEVICE` | all devices | Publish only this device serial number (DSN) |
+| `OWLET_ATTRIBUTES` | all attributes | Comma separated list of attributes to publish |
+| `OWLET_PUBLISH_MODE` | `latest` | `latest` keeps one entry per device, `history` writes one entry per reading |
+| `OWLET_LOG_LEVEL` | `info` | `debug`, `info`, `warning` or `error` |
+| `HOMEAPI_URL` | `http://localhost:9999` | Base URL of the HomeAPI server |
+| `HOMEAPI_CATEGORY` | `owlet` | HomeAPI category for the created entries |
+| `HOMEAPI_KEY_PREFIX` | `owlet` | Prefix of the HomeAPI entry key |
+| `HOMEAPI_TIMEOUT` | `10` | HTTP timeout for HomeAPI requests, in seconds |
+
+The installer itself understands a few more variables: `OWLET_REPO`, `OWLET_REF` (branch, tag or commit to deploy, default `master`), `OWLET_PREFIX` (default `/opt/owlet-homeapi`) and `OWLET_USER` (default `owlet`).
+
+### What ends up in HomeAPI
+In the default `latest` mode the service keeps a single entry per device, at category `owlet` and key `owlet_<DSN>`, and updates it on every poll. In `history` mode it creates one entry per reading, keyed `owlet_<DSN>_<epoch>` - at a 2 second interval that is roughly 43000 entries per device per day, so only enable it if you really want the raw series.
+
+```bash
+$ curl -s "http://homeapi.local:9999/api/entries?category=owlet"
+```
+```json
+{
+  "dsn": "AC000W00REDACTED",
+  "connection_status": "Online",
+  "timestamp": 1546552539.567,
+  "collected_at": "2019-01-03T21:55:39.567Z",
+  "baby_name": "Little Baby",
+  "vitals": {
+    "heart_rate": 136,
+    "oxygen_level": 96,
+    "movement": 1,
+    "battery_level": 81,
+    "charge_status": 0,
+    "sock_connection": 1,
+    "base_station_on": 1
+  },
+  "alerts": {
+    "critical_battery": 0,
+    "critical_oxygen": 0,
+    "high_heart_rate": 0,
+    "low_battery": 0,
+    "low_heart_rate": 0,
+    "low_oxygen": 0,
+    "sock_disconnected": 0
+  },
+  "attributes": {
+    "HEART_RATE": 136,
+    "OXYGEN_LEVEL": 96,
+    "...": "every other attribute of the device"
+  }
+}
+```
+
+### Running it by hand
+The daemon is a normal console script, so it can be run outside of systemd for a quick check - it takes its configuration from the environment:
+
+```bash
+# Validate the configuration and exit
+OWLET_EMAIL=you@example.org OWLET_PASSWORD='...' owlet-homeapi --check-config
+
+# Publish exactly one reading and exit
+OWLET_EMAIL=you@example.org OWLET_PASSWORD='...' HOMEAPI_URL=http://homeapi.local:9999 owlet-homeapi --once
+```
+
+A reference unit file is available at [`deploy/owlet-homeapi.service`](deploy/owlet-homeapi.service); the installer fills in its `@USER@`, `@PREFIX@` and `@CONFIG@` placeholders.
+
 ## What are the properties for a device ?
 | Attribute           | Human Readable        | Example value  | Interpretation  | 
 | ------------------- | --------------------- | -------------- | ----------

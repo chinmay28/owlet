@@ -35,6 +35,7 @@ setup(name = name,
         entry_points = {
             'console_scripts': [
                 'owlet=owlet_api.cli:cli',
+                'owlet-homeapi=owlet_api.homeapi_publisher:main',
             ]
         },
         test_suite = 'tests',
