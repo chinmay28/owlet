@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily roll up of the Owlet readings stored in HomeAPI
+Documentation=https://github.com/chinmay28/owlet
+
+[Timer]
+OnCalendar=@SCHEDULE@
+# Spread the load a little, and catch up after the Pi was switched off.
+RandomizedDelaySec=300
+Persistent=true
+Unit=owlet-summarize.service
+
+[Install]
+WantedBy=timers.target

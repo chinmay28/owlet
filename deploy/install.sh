@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# One line installer for the owlet-homeapi systemd service.
+# One line installer for the owlet-homeapi systemd services: the
+# publisher that stores Owlet readings in HomeAPI, and the daily timer
+# that rolls them up and deletes the per-reading entries afterwards.
 #
 #   curl -fsSL https://raw.githubusercontent.com/chinmay28/owlet/master/deploy/install.sh \
 #     | sudo OWLET_EMAIL=you@example.com OWLET_PASSWORD='secret' \
@@ -16,9 +18,11 @@ OWLET_REF="${OWLET_REF:-master}"
 OWLET_PREFIX="${OWLET_PREFIX:-/opt/owlet-homeapi}"
 OWLET_USER="${OWLET_USER:-owlet}"
 SERVICE_NAME="owlet-homeapi"
+SUMMARY_NAME="owlet-summarize"
+OWLET_SUMMARY_SCHEDULE="${OWLET_SUMMARY_SCHEDULE:-*-*-* 00:30:00}"
 CONFIG_DIR="/etc/${SERVICE_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/${SERVICE_NAME}.env"
-UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+UNIT_DIR="/etc/systemd/system"
 SRC_DIR="${OWLET_PREFIX}/src"
 VENV_DIR="${OWLET_PREFIX}/venv"
 
@@ -37,6 +41,10 @@ CONFIG_VARS=(
     HOMEAPI_CATEGORY
     HOMEAPI_KEY_PREFIX
     HOMEAPI_TIMEOUT
+    HOMEAPI_SUMMARY_CATEGORY
+    HOMEAPI_SUMMARY_KEY_PREFIX
+    OWLET_SUMMARY_METRICS
+    OWLET_RAW_RETENTION_DAYS
 )
 
 # Defaults for anything neither configured before nor passed in.
@@ -47,12 +55,16 @@ declare -A CONFIG_DEFAULTS=(
     [OWLET_REACTIVATE_INTERVAL]="10"
     [OWLET_DEVICE]=""
     [OWLET_ATTRIBUTES]=""
-    [OWLET_PUBLISH_MODE]="latest"
+    [OWLET_PUBLISH_MODE]="history"
     [OWLET_LOG_LEVEL]="info"
     [HOMEAPI_URL]="http://localhost:9999"
     [HOMEAPI_CATEGORY]="owlet"
     [HOMEAPI_KEY_PREFIX]="owlet"
     [HOMEAPI_TIMEOUT]="10"
+    [HOMEAPI_SUMMARY_CATEGORY]="owlet_summary"
+    [HOMEAPI_SUMMARY_KEY_PREFIX]="owlet_summary"
+    [OWLET_SUMMARY_METRICS]=""
+    [OWLET_RAW_RETENTION_DAYS]="0"
 )
 
 log() {
@@ -150,8 +162,11 @@ install_package() {
     "${VENV_DIR}/bin/pip" install --quiet --upgrade requests python-dateutil
     "${VENV_DIR}/bin/pip" install --quiet --upgrade --no-deps "$SRC_DIR"
 
-    [ -x "${VENV_DIR}/bin/owlet-homeapi" ] ||
-        die "Installation failed, ${VENV_DIR}/bin/owlet-homeapi is missing."
+    local command
+    for command in owlet-homeapi owlet-homeapi-summarize; do
+        [ -x "${VENV_DIR}/bin/${command}" ] ||
+            die "Installation failed, ${VENV_DIR}/bin/${command} is missing."
+    done
 
     # The tree stays owned by root and world readable: the service only
     # needs to read and execute it, never to write to it.
@@ -218,13 +233,22 @@ write_config() {
 }
 
 install_unit() {
-    log "Installing ${UNIT_FILE}"
+    local name="$1" target="${UNIT_DIR}/$1"
+
+    log "Installing ${target}"
     sed -e "s|@USER@|${OWLET_USER}|g" \
         -e "s|@PREFIX@|${OWLET_PREFIX}|g" \
         -e "s|@CONFIG@|${CONFIG_FILE}|g" \
-        "${SRC_DIR}/deploy/${SERVICE_NAME}.service" >"${UNIT_FILE}.tmp"
-    mv "${UNIT_FILE}.tmp" "$UNIT_FILE"
-    chmod 0644 "$UNIT_FILE"
+        -e "s|@SCHEDULE@|${OWLET_SUMMARY_SCHEDULE}|g" \
+        "${SRC_DIR}/deploy/${name}" >"${target}.tmp"
+    mv "${target}.tmp" "$target"
+    chmod 0644 "$target"
+}
+
+install_units() {
+    install_unit "${SERVICE_NAME}.service"
+    install_unit "${SUMMARY_NAME}.service"
+    install_unit "${SUMMARY_NAME}.timer"
     systemctl daemon-reload
 }
 
@@ -252,6 +276,17 @@ start_service() {
     fi
 }
 
+start_timer() {
+    log "Enabling ${SUMMARY_NAME}.timer (${OWLET_SUMMARY_SCHEDULE})"
+    systemctl enable "${SUMMARY_NAME}.timer" >/dev/null 2>&1 || true
+    systemctl restart "${SUMMARY_NAME}.timer"
+
+    if ! systemctl is-active --quiet "${SUMMARY_NAME}.timer"; then
+        warn "${SUMMARY_NAME}.timer is not active, recent log output:"
+        journalctl -u "${SUMMARY_NAME}.timer" -n 20 --no-pager >&2 || true
+    fi
+}
+
 main() {
     require_root
     install_prereqs
@@ -259,17 +294,25 @@ main() {
     fetch_source
     install_package
     write_config
-    install_unit
+    install_units
     start_service
+    start_timer
 
     cat <<EOF
 
   Installed.
 
     Configuration : ${CONFIG_FILE}
-    Service       : systemctl status ${SERVICE_NAME}
+    Collector     : systemctl status ${SERVICE_NAME}
     Live logs     : journalctl -u ${SERVICE_NAME} -f
     Restart       : sudo systemctl restart ${SERVICE_NAME}
+
+    Daily roll up : systemctl list-timers ${SUMMARY_NAME}.timer
+    Roll up logs  : journalctl -u ${SUMMARY_NAME} -f
+    Run it now    : sudo systemctl start ${SUMMARY_NAME}.service
+    Preview it    : sudo systemd-run --pty --uid=${OWLET_USER} \\
+                      --property=EnvironmentFile=${CONFIG_FILE} \\
+                      ${VENV_DIR}/bin/owlet-homeapi-summarize --dry-run
 
 EOF
 }

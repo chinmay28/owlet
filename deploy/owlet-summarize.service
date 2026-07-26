@@ -1,0 +1,36 @@
+[Unit]
+Description=Roll up the Owlet readings stored in HomeAPI
+Documentation=https://github.com/chinmay28/owlet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+EnvironmentFile=@CONFIG@
+ExecStart=@PREFIX@/venv/bin/owlet-homeapi-summarize
+# Deleting a day of per-reading entries is one request per entry, which
+# takes a few minutes for a full day. Give it room, but never forever.
+TimeoutStartSec=2h
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=owlet-summarize
+
+# The job only needs outbound network access, nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=

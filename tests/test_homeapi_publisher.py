@@ -69,7 +69,7 @@ def test_config_defaults():
     assert config.reactivate_interval == 10.0
     assert config.category == 'owlet'
     assert config.key_prefix == 'owlet'
-    assert config.mode == 'latest'
+    assert config.mode == 'history'
     assert config.device is None
     assert config.attributes == []
     assert config.homeapi_url == 'http://homeapi.local:9999'
@@ -237,13 +237,11 @@ def test_client_health():
 def test_publisher_entry_keys():
     device = FakeDevice()
 
-    publisher = Publisher(make_config(), api=Mock(), client=Mock())
-    assert publisher.entry_key(device, 1546552539.5) == 'owlet_AC000W00TEST'
-
-    publisher = Publisher(make_config(OWLET_PUBLISH_MODE='history',
-                                      HOMEAPI_KEY_PREFIX='sock'),
+    publisher = Publisher(make_config(HOMEAPI_KEY_PREFIX='sock'),
                           api=Mock(), client=Mock())
-    assert publisher.entry_key(device, 1546552539.5) == \
+
+    assert publisher.latest_key(device) == 'sock_AC000W00TEST'
+    assert publisher.history_key(device, 1546552539.5) == \
         'sock_AC000W00TEST_1546552539'
 
 
@@ -252,7 +250,8 @@ def test_publisher_publishes_latest_via_upsert():
     client = Mock()
     client.upsert.return_value = True
 
-    publisher = Publisher(make_config(), api=Mock(), client=client)
+    publisher = Publisher(make_config(OWLET_PUBLISH_MODE='latest'),
+                          api=Mock(), client=client)
 
     assert publisher.publish(device, timestamp=1.0) is True
     client.upsert.assert_called_once()
@@ -268,12 +267,40 @@ def test_publisher_publishes_history_via_create():
     client = Mock()
     client.create.return_value = True
 
-    publisher = Publisher(make_config(OWLET_PUBLISH_MODE='history'),
-                          api=Mock(), client=client)
+    publisher = Publisher(make_config(), api=Mock(), client=client)
 
     assert publisher.publish(device, timestamp=1.0) is True
     client.create.assert_called_once()
     assert client.upsert.called is False
+
+    key, _ = client.create.call_args[0]
+    assert key == 'owlet_AC000W00TEST_1'
+
+
+def test_publisher_both_mode_writes_latest_and_history():
+    device = FakeDevice()
+    client = Mock()
+    client.create.return_value = True
+    client.upsert.return_value = True
+
+    publisher = Publisher(make_config(OWLET_PUBLISH_MODE='both'),
+                          api=Mock(), client=client)
+
+    assert publisher.publish(device, timestamp=1.0) is True
+    assert client.upsert.call_args[0][0] == 'owlet_AC000W00TEST'
+    assert client.create.call_args[0][0] == 'owlet_AC000W00TEST_1'
+
+
+def test_publisher_reports_a_partial_failure():
+    device = FakeDevice()
+    client = Mock()
+    client.create.return_value = False
+    client.upsert.return_value = True
+
+    publisher = Publisher(make_config(OWLET_PUBLISH_MODE='both'),
+                          api=Mock(), client=client)
+
+    assert publisher.publish(device, timestamp=1.0) is False
 
 
 def test_publisher_filters_devices():
@@ -294,14 +321,14 @@ def test_publisher_poll_once():
     api = Mock()
     api.get_devices.return_value = [device]
     client = Mock()
-    client.upsert.return_value = True
+    client.create.return_value = True
 
     publisher = Publisher(make_config(), api=api, client=client)
 
     assert publisher.poll_once() == 1
     device.update.assert_called_once()
     device.reactivate.assert_called_once()
-    client.upsert.assert_called_once()
+    client.create.assert_called_once()
 
     # The stream is only re-armed once per reactivate interval.
     assert publisher.poll_once() == 1
@@ -318,7 +345,7 @@ def test_publisher_poll_once_skips_unreachable_device():
     publisher = Publisher(make_config(), api=api, client=client)
 
     assert publisher.poll_once() == 0
-    assert client.upsert.called is False
+    assert client.create.called is False
 
 
 def test_publisher_poll_once_survives_failed_reactivate():
@@ -328,7 +355,7 @@ def test_publisher_poll_once_survives_failed_reactivate():
     api = Mock()
     api.get_devices.return_value = [device]
     client = Mock()
-    client.upsert.return_value = True
+    client.create.return_value = True
 
     publisher = Publisher(make_config(), api=api, client=client)
 
@@ -341,13 +368,13 @@ def test_publisher_run_stops_after_max_cycles():
     api.get_devices.return_value = [device]
     client = Mock()
     client.health.return_value = True
-    client.upsert.return_value = True
+    client.create.return_value = True
 
     publisher = Publisher(make_config(), api=api, client=client)
 
     assert publisher.run(max_cycles=2) == 2
     api.login.assert_called_once()
-    assert client.upsert.call_count == 2
+    assert client.create.call_count == 2
 
 
 def test_publisher_run_stops_on_signal():
@@ -356,7 +383,7 @@ def test_publisher_run_stops_on_signal():
     api.get_devices.return_value = [device]
     client = Mock()
     client.health.return_value = False
-    client.upsert.return_value = True
+    client.create.return_value = True
 
     publisher = Publisher(make_config(OWLET_POLL_INTERVAL='0.01'),
                           api=api, client=client)
