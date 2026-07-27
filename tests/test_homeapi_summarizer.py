@@ -13,6 +13,7 @@ import responses
 os.environ['TZ'] = 'UTC'
 time.tzset()
 
+from owlet_api.homeapiclient import DEFAULT_DELETE_BATCH_SIZE  # noqa: E402
 from owlet_api.homeapiclient import HomeAPIClient          # noqa: E402
 from owlet_api.homeapiclient import HomeAPIError           # noqa: E402
 from owlet_api.homeapiclient import MAX_VALUE_CHARS        # noqa: E402
@@ -76,6 +77,7 @@ class FakeHomeAPI():
         self.fail_page = None
         self.fail_delete = set()
         self.deleted = []
+        self.delete_batches = []
 
     def add(self, key, value):
         self.store[self.next_id] = {'id': self.next_id, 'key': key,
@@ -127,6 +129,21 @@ class FakeHomeAPI():
         self.store.pop(identifier, None)
         self.deleted.append(identifier)
         return True
+
+    def delete_ids(self, identifiers):
+        identifiers = list(identifiers)
+        self.delete_batches.append(len(identifiers))
+
+        # HomeAPI deletes a batch in one transaction, so a failing
+        # request loses the whole batch.
+        if self.fail_delete.intersection(identifiers):
+            return 0, len(identifiers)
+
+        for identifier in identifiers:
+            self.store.pop(identifier, None)
+            self.deleted.append(identifier)
+
+        return len(identifiers), 0
 
 
 def make_config(**overrides):
@@ -287,6 +304,7 @@ def test_decode_value_handles_strings_and_objects():
 def test_summary_config_defaults():
     config = make_config()
 
+    assert config.delete_batch_size == DEFAULT_DELETE_BATCH_SIZE
     assert config.category == 'owlet'
     assert config.key_prefix == 'owlet'
     assert config.summary_category == 'owlet_summary'
@@ -306,10 +324,22 @@ def test_summary_config_rejects_bad_values():
     with pytest.raises(ConfigurationError):
         make_config(OWLET_RAW_RETENTION_DAYS='soon')
 
+    with pytest.raises(ConfigurationError):
+        make_config(HOMEAPI_DELETE_BATCH_SIZE='0')
+
+    with pytest.raises(ConfigurationError):
+        make_config(HOMEAPI_DELETE_BATCH_SIZE='lots')
+
     # Summaries must not be stored where the raw readings live.
     with pytest.raises(ConfigurationError):
         make_config(HOMEAPI_SUMMARY_CATEGORY='owlet',
                     HOMEAPI_SUMMARY_KEY_PREFIX='owlet')
+
+
+def test_summary_config_passes_the_batch_size_to_the_client():
+    summarizer = Summarizer(make_config(HOMEAPI_DELETE_BATCH_SIZE='42'))
+
+    assert summarizer.raw_client.delete_batch_size == 42
 
 
 # --- entry parsing ----------------------------------------------------
@@ -546,8 +576,20 @@ def test_run_reports_failed_deletions():
 
     report = summarizer.run(today=TUESDAY)
 
-    assert report['entries_deleted'] == 2
-    assert report['delete_failures'] == 1
+    # A bulk delete is one transaction, so nothing of that batch is gone
+    # and the next run picks the readings up again.
+    assert report['entries_deleted'] == 0
+    assert report['delete_failures'] == 3
+    assert raw.deleted == []
+
+
+def test_run_deletes_the_readings_of_a_day_in_one_batch():
+    summarizer, raw, _ = build()
+    raw_ids = fill_day(raw, MONDAY, samples=5, hours=(0, 12))
+
+    summarizer.run(today=TUESDAY)
+
+    assert raw.delete_batches == [len(raw_ids)]
 
 
 def test_run_keeps_a_more_complete_existing_summary():
@@ -764,6 +806,119 @@ def test_client_get_and_delete():
     assert client.get('owlet_test') == {'samples': 5}
     assert client.delete(7) is True
     assert client.delete(8) is False
+
+
+@responses.activate
+def test_client_delete_ids_uses_one_bulk_request():
+    responses.add(responses.DELETE, 'http://homeapi.local:9999/api/entries',
+                  json={'deleted': 3, 'matched': 3, 'dry_run': False,
+                        'entries': []}, status=200)
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet')
+
+    assert client.delete_ids([7, 8, 9]) == (3, 0)
+    assert len(responses.calls) == 1
+
+    body = json.loads(responses.calls[0].request.body.decode('utf-8'))
+    # The category narrows the match, so ids can only ever remove
+    # entries of this category.
+    assert body == {'ids': [7, 8, 9], 'category': 'owlet'}
+
+
+@responses.activate
+def test_client_delete_ids_batches_large_lists():
+    for deleted in (2, 2, 1):
+        responses.add(responses.DELETE,
+                      'http://homeapi.local:9999/api/entries',
+                      json={'deleted': deleted, 'matched': deleted},
+                      status=200)
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet',
+                           delete_batch_size=2)
+
+    assert client.delete_ids([1, 2, 3, 4, 5]) == (5, 0)
+    assert len(responses.calls) == 3
+    assert [len(json.loads(call.request.body.decode('utf-8'))['ids'])
+            for call in responses.calls] == [2, 2, 1]
+
+
+@responses.activate
+def test_client_delete_ids_reports_entries_that_were_already_gone():
+    responses.add(responses.DELETE, 'http://homeapi.local:9999/api/entries',
+                  json={'deleted': 1, 'matched': 1}, status=200)
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet')
+
+    # Two of the three ids no longer exist, which is not a failure.
+    assert client.delete_ids([1, 2, 3]) == (1, 0)
+
+
+@responses.activate
+def test_client_delete_ids_fails_a_whole_batch():
+    responses.add(responses.DELETE, 'http://homeapi.local:9999/api/entries',
+                  json={'error': 'boom'}, status=500)
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet')
+
+    # The bulk delete runs in one transaction, so nothing was removed.
+    assert client.delete_ids([1, 2, 3]) == (0, 3)
+
+
+@responses.activate
+def test_client_delete_ids_handles_a_missing_count():
+    responses.add(responses.DELETE, 'http://homeapi.local:9999/api/entries',
+                  json={'matched': 3}, status=200)
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet')
+
+    assert client.delete_ids([1, 2, 3]) == (0, 3)
+
+
+@responses.activate
+def test_client_delete_ids_falls_back_on_an_older_server():
+    # An older HomeAPI without bulk delete answers 405 on the collection.
+    responses.add(responses.DELETE, 'http://homeapi.local:9999/api/entries',
+                  status=405)
+    for identifier in (1, 2, 3, 4):
+        responses.add(responses.DELETE,
+                      'http://homeapi.local:9999/api/entries/%d' % identifier,
+                      json={'deleted': True}, status=200)
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet',
+                           delete_batch_size=2)
+
+    assert client.delete_ids([1, 2, 3, 4]) == (4, 0)
+    assert client.bulk_delete is False
+    # One rejected bulk request, then one request per entry, and the
+    # second batch does not try the bulk endpoint again.
+    assert [call.request.url for call in responses.calls] == [
+        'http://homeapi.local:9999/api/entries',
+        'http://homeapi.local:9999/api/entries/1',
+        'http://homeapi.local:9999/api/entries/2',
+        'http://homeapi.local:9999/api/entries/3',
+        'http://homeapi.local:9999/api/entries/4',
+    ]
+
+
+def test_client_clamps_the_delete_batch_size():
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet',
+                           delete_batch_size=0)
+    assert client.delete_batch_size == 1
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet',
+                           delete_batch_size=1000000)
+    assert client.delete_batch_size == 5000
+
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet')
+    assert client.delete_batch_size == DEFAULT_DELETE_BATCH_SIZE
+
+
+@responses.activate
+def test_client_delete_ids_without_ids_does_nothing():
+    client = HomeAPIClient('http://homeapi.local:9999', 'owlet')
+
+    assert client.delete_ids([]) == (0, 0)
+    assert len(responses.calls) == 0
 
 
 @responses.activate

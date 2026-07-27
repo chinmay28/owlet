@@ -150,6 +150,7 @@ All settings live in `/etc/owlet-homeapi/owlet-homeapi.env` (mode `0640`, readab
 | `HOMEAPI_CATEGORY` | `owlet` | HomeAPI category for the created entries |
 | `HOMEAPI_KEY_PREFIX` | `owlet` | Prefix of the HomeAPI entry key |
 | `HOMEAPI_TIMEOUT` | `10` | HTTP timeout for HomeAPI requests, in seconds |
+| `HOMEAPI_DELETE_BATCH_SIZE` | `500` | Entries per bulk delete request during the roll up |
 | `HOMEAPI_SUMMARY_CATEGORY` | `owlet_summary` | HomeAPI category the summaries are written to |
 | `HOMEAPI_SUMMARY_KEY_PREFIX` | `owlet_summary` | Prefix of the summary entry keys |
 | `OWLET_SUMMARY_METRICS` | the four vitals below | Comma separated list of metrics to summarize |
@@ -209,7 +210,7 @@ $ curl -s "http://homeapi.local:9999/api/entries?category=owlet"
 1. reads the readings of that day out of HomeAPI, page by page,
 2. writes the daily summary entry: overall and per-hour statistics for each metric,
 3. rebuilds the summary of the ISO week that day belongs to from the daily summaries of that week,
-4. and only then deletes the raw entries it just summarized.
+4. and only then deletes the raw entries it just summarized, in bulk.
 
 Step 4 is strictly last, and it is skipped for that day if either summary could not be written, so a HomeAPI hiccup costs you a night of raw data at worst, never the data itself. If a delete fails halfway through, the next run re-summarizes what is left but keeps the more complete summary it already wrote, and finishes the clean up.
 
@@ -260,7 +261,9 @@ $ curl -s "http://homeapi.local:9999/api/entries/owlet_summary_AC000W00REDACTED_
 
 A full day summary is around 25 KB of JSON, well inside HomeAPI's 100000 character limit for an entry value; if a pathological day would exceed it, the hourly histograms and then the hourly percentiles are dropped before the summary is written, and the roll up says so in the log.
 
-Deleting a day of readings is one `DELETE` request per entry - about 43000 of them - so expect the nightly run to take a few minutes on a Pi. `TimeoutStartSec=2h` in the unit gives it room.
+The clean up uses HomeAPI's bulk delete (`DELETE /api/entries`) with the ids of the entries that were just summarized, so a full day is around 90 requests instead of 43000. Every request also carries `category`, which HomeAPI ANDs with the ids, so a stale id can never take an entry outside the raw category with it. `HOMEAPI_DELETE_BATCH_SIZE` (default 500) sets the ids per request; HomeAPI turns each id into one SQL placeholder, and SQLite before 3.32 caps a statement at 999 of them, hence the conservative default.
+
+A bulk delete is one transaction on HomeAPI's side, so a request that fails removes nothing: the roll up counts that batch as failed, exits non-zero, keeps the summary it already wrote and picks the readings up again on the next run. If HomeAPI is older than the bulk delete endpoint and answers `405`, the roll up says so in the log and falls back to one request per entry for the rest of the run.
 
 ### Running it by hand
 Both commands are normal console scripts that take their configuration from the environment, so they can be run outside of systemd:

@@ -22,6 +22,12 @@ MAX_VALUE_CHARS = 100000
 # HomeAPI clamps per_page to this maximum.
 MAX_PER_PAGE = 200
 
+# Ids sent per bulk delete request. HomeAPI turns them into one SQL
+# placeholder each, and SQLite before 3.32 allows 999 variables per
+# statement, so keep a comfortable margin below that.
+DEFAULT_DELETE_BATCH_SIZE = 500
+MAX_DELETE_BATCH_SIZE = 5000
+
 
 class HomeAPIError(Exception):
     """Raised when HomeAPI cannot be read reliably."""
@@ -31,12 +37,17 @@ class HomeAPIClient():
     """Minimal client for the HomeAPI entries endpoint."""
 
     def __init__(self, base_url, category, timeout=DEFAULT_HTTP_TIMEOUT,
-                 session=None):
+                 session=None, delete_batch_size=DEFAULT_DELETE_BATCH_SIZE):
         """Initialize the client for the given HomeAPI base url."""
         self.base_url = base_url.rstrip('/')
         self.category = category
         self.timeout = timeout
         self.session = session if session is not None else requests.Session()
+        self.delete_batch_size = max(
+            1, min(delete_batch_size, MAX_DELETE_BATCH_SIZE))
+        # None until the first bulk delete tells us whether the server
+        # supports the endpoint.
+        self.bulk_delete = None
 
     def health(self):
         """Return True if the HomeAPI server answers its health check."""
@@ -209,6 +220,96 @@ class HomeAPIClient():
         LOGGER.warning('HomeAPI delete for %s returned %s: %s',
                        identifier, result.status_code, _body(result))
         return False
+
+    def delete_ids(self, identifiers):
+        """Delete entries of this category by id, in batches.
+
+        Uses the bulk delete endpoint, so a day of readings costs a
+        couple of requests instead of one per entry. Returns
+        (deleted, failed); ids that no longer exist are neither deleted
+        nor failed, they simply do not match any more.
+        """
+        remaining = list(identifiers)
+        deleted = 0
+        failed = 0
+
+        while remaining:
+            batch = remaining[:self.delete_batch_size]
+            remaining = remaining[self.delete_batch_size:]
+
+            if self.bulk_delete is False:
+                gone, lost = self._delete_one_by_one(batch)
+            else:
+                gone, lost = self._bulk_delete_batch(batch)
+
+            deleted = deleted + gone
+            failed = failed + lost
+
+        return deleted, failed
+
+    def _bulk_delete_batch(self, batch):
+        """Delete one batch of ids with the bulk delete endpoint."""
+        try:
+            result = self.session.delete(
+                self.base_url + '/api/entries',
+                # The category narrows the match, so a wrong id can
+                # never take an entry outside of this category with it.
+                json={'ids': batch, 'category': self.category},
+                timeout=self.timeout,
+            )
+        except RequestException as error:
+            LOGGER.warning('HomeAPI bulk delete of %d entries failed: %s',
+                           len(batch), error)
+            return 0, len(batch)
+
+        # An older HomeAPI without the bulk delete endpoint answers with
+        # "method not allowed". Fall back for the rest of this run.
+        if result.status_code in (404, 405, 501):
+            LOGGER.info('HomeAPI does not support bulk delete (status %s), '
+                        'falling back to one request per entry',
+                        result.status_code)
+            self.bulk_delete = False
+            return self._delete_one_by_one(batch)
+
+        if result.status_code != 200:
+            LOGGER.warning('HomeAPI bulk delete of %d entries returned '
+                           '%s: %s', len(batch), result.status_code,
+                           _body(result))
+            return 0, len(batch)
+
+        self.bulk_delete = True
+
+        try:
+            payload = result.json()
+        except ValueError:
+            LOGGER.warning('HomeAPI bulk delete sent invalid json')
+            return 0, len(batch)
+
+        deleted = payload.get('deleted')
+
+        if not isinstance(deleted, int):
+            LOGGER.warning('HomeAPI bulk delete did not report a count: %s',
+                           _body(result))
+            return 0, len(batch)
+
+        if deleted < len(batch):
+            LOGGER.debug('Bulk delete removed %d of %d entries, the rest '
+                         'was already gone', deleted, len(batch))
+
+        return deleted, 0
+
+    def _delete_one_by_one(self, batch):
+        """Delete a batch of ids with one request per entry."""
+        deleted = 0
+        failed = 0
+
+        for identifier in batch:
+            if self.delete(identifier):
+                deleted = deleted + 1
+            else:
+                failed = failed + 1
+
+        return deleted, failed
 
 
 def decode_value(value):

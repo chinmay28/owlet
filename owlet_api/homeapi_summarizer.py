@@ -28,6 +28,7 @@ import time
 from datetime import date
 from datetime import timedelta
 
+from .homeapiclient import DEFAULT_DELETE_BATCH_SIZE
 from .homeapiclient import HomeAPIClient
 from .homeapiclient import HomeAPIError
 from .homeapiclient import MAX_VALUE_CHARS
@@ -102,6 +103,8 @@ class SummaryConfig():
             list(DEFAULT_METRICS)
         self.retention_days = get_int(
             env, 'OWLET_RAW_RETENTION_DAYS', DEFAULT_RETENTION_DAYS)
+        self.delete_batch_size = get_int(
+            env, 'HOMEAPI_DELETE_BATCH_SIZE', DEFAULT_DELETE_BATCH_SIZE)
         self.device = get_optional(env, 'OWLET_DEVICE')
         self.log_level = env.get('OWLET_LOG_LEVEL', 'info').strip().upper()
 
@@ -114,6 +117,10 @@ class SummaryConfig():
         if self.retention_days < 0:
             raise ConfigurationError(
                 'OWLET_RAW_RETENTION_DAYS must not be negative')
+
+        if self.delete_batch_size < 1:
+            raise ConfigurationError(
+                'HOMEAPI_DELETE_BATCH_SIZE must be at least 1')
 
         if self.summary_category == self.category and \
            self.summary_key_prefix == self.key_prefix:
@@ -385,7 +392,8 @@ class Summarizer():
         self.config = config
         self.raw_client = raw_client if raw_client is not None else \
             HomeAPIClient(config.homeapi_url, config.category,
-                          config.http_timeout)
+                          config.http_timeout,
+                          delete_batch_size=config.delete_batch_size)
         self.summary_client = summary_client \
             if summary_client is not None else \
             HomeAPIClient(config.homeapi_url, config.summary_category,
@@ -575,16 +583,7 @@ class Summarizer():
 
     def delete_raw(self, bucket):
         """Delete the raw entries of a bucket, return (deleted, failed)."""
-        deleted = 0
-        failed = 0
-
-        for entry_id in bucket.entry_ids:
-            if self.raw_client.delete(entry_id):
-                deleted = deleted + 1
-            else:
-                failed = failed + 1
-
-        return deleted, failed
+        return self.raw_client.delete_ids(bucket.entry_ids)
 
     # The run loop is a sequence of clearly named steps, splitting it up
     # further would not make it easier to follow.

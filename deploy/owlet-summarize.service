@@ -10,9 +10,10 @@ User=@USER@
 Group=@USER@
 EnvironmentFile=@CONFIG@
 ExecStart=@PREFIX@/venv/bin/owlet-homeapi-summarize
-# Deleting a day of per-reading entries is one request per entry, which
-# takes a few minutes for a full day. Give it room, but never forever.
-TimeoutStartSec=2h
+# Reading a backlog of per-reading entries takes a while, and the clean
+# up of an older HomeAPI without bulk delete takes longer still. Give it
+# room, but never forever.
+TimeoutStartSec=1h
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=owlet-summarize
