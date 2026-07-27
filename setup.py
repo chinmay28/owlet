@@ -36,6 +36,8 @@ setup(name = name,
             'console_scripts': [
                 'owlet=owlet_api.cli:cli',
                 'owlet-homeapi=owlet_api.homeapi_publisher:main',
+                'owlet-homeapi-summarize='
+                'owlet_api.homeapi_summarizer:main',
             ]
         },
         test_suite = 'tests',

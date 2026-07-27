@@ -12,16 +12,20 @@ unit sources from ``/etc/owlet-homeapi/owlet-homeapi.env``.
 """
 
 import argparse
-import json
 import logging
 import os
 import signal
 import sys
 import time
 
-import requests
-from requests.exceptions import RequestException
-
+from .homeapiclient import DEFAULT_HTTP_TIMEOUT
+from .homeapiclient import HomeAPIClient
+from .homeapiconfig import ConfigurationError
+from .homeapiconfig import get_float
+from .homeapiconfig import get_list
+from .homeapiconfig import get_optional
+from .homeapiconfig import sanitize_key
+from .homeapiconfig import setup_logging
 from .owletapi import OwletAPI
 from .owletexceptions import OwletException
 from .owletexceptions import OwletTemporaryCommunicationException
@@ -34,9 +38,12 @@ DEFAULT_REACTIVATE_INTERVAL = 10.0
 DEFAULT_HOMEAPI_URL = 'http://localhost:9999'
 DEFAULT_CATEGORY = 'owlet'
 DEFAULT_KEY_PREFIX = 'owlet'
-DEFAULT_HTTP_TIMEOUT = 10.0
 DEFAULT_LOGIN_BACKOFF = 30.0
 MAX_LOGIN_BACKOFF = 300.0
+
+# "latest" keeps one continuously updated entry per device, "history"
+# writes one entry per reading and "both" does the two of them.
+PUBLISH_MODES = ('latest', 'history', 'both')
 
 # Attributes that are lifted out of the raw attribute dump into a
 # stable, easy to consume "vitals" object.
@@ -64,10 +71,6 @@ ALERTS = {
 }
 
 
-class ConfigurationError(Exception):
-    """Raised when the environment does not contain a usable config."""
-
-
 class Config():
     """Runtime configuration, read from the process environment."""
 
@@ -80,20 +83,20 @@ class Config():
 
         self.email = env.get('OWLET_EMAIL', '').strip()
         self.password = env.get('OWLET_PASSWORD', '')
-        self.device = _get_optional(env, 'OWLET_DEVICE')
-        self.poll_interval = _get_float(
+        self.device = get_optional(env, 'OWLET_DEVICE')
+        self.poll_interval = get_float(
             env, 'OWLET_POLL_INTERVAL', DEFAULT_POLL_INTERVAL)
-        self.reactivate_interval = _get_float(
+        self.reactivate_interval = get_float(
             env, 'OWLET_REACTIVATE_INTERVAL', DEFAULT_REACTIVATE_INTERVAL)
-        self.attributes = _get_list(env, 'OWLET_ATTRIBUTES')
+        self.attributes = get_list(env, 'OWLET_ATTRIBUTES')
         self.homeapi_url = env.get(
             'HOMEAPI_URL', DEFAULT_HOMEAPI_URL).strip().rstrip('/')
         self.category = env.get('HOMEAPI_CATEGORY', DEFAULT_CATEGORY).strip()
         self.key_prefix = env.get(
             'HOMEAPI_KEY_PREFIX', DEFAULT_KEY_PREFIX).strip()
-        self.http_timeout = _get_float(
+        self.http_timeout = get_float(
             env, 'HOMEAPI_TIMEOUT', DEFAULT_HTTP_TIMEOUT)
-        self.mode = env.get('OWLET_PUBLISH_MODE', 'latest').strip().lower()
+        self.mode = env.get('OWLET_PUBLISH_MODE', 'history').strip().lower()
         self.log_level = env.get('OWLET_LOG_LEVEL', 'info').strip().upper()
 
     def validate(self):
@@ -107,145 +110,14 @@ class Config():
             raise ConfigurationError(
                 'HOMEAPI_URL must start with http:// or https://')
 
-        if self.mode not in ('latest', 'history'):
+        if self.mode not in PUBLISH_MODES:
             raise ConfigurationError(
-                'OWLET_PUBLISH_MODE must be either "latest" or "history"')
+                'OWLET_PUBLISH_MODE must be one of %s'
+                % ', '.join(sorted(PUBLISH_MODES)))
 
         if self.poll_interval <= 0:
             raise ConfigurationError(
                 'OWLET_POLL_INTERVAL must be greater than zero')
-
-
-def _get_optional(env, name):
-    """Return a stripped environment value or None if it is empty."""
-    value = env.get(name, '').strip()
-    return value if value else None
-
-
-def _get_float(env, name, default):
-    """Return an environment value as float, falling back to default."""
-    value = env.get(name, '').strip()
-
-    if not value:
-        return default
-
-    try:
-        return float(value)
-    except ValueError as error:
-        raise ConfigurationError(
-            '%s must be a number, got "%s"' % (name, value)) from error
-
-
-def _get_list(env, name):
-    """Return a comma separated environment value as list of strings."""
-    value = env.get(name, '').strip()
-
-    if not value:
-        return []
-
-    return [item.strip() for item in value.split(',') if item.strip()]
-
-
-def sanitize_key(value):
-    """Make ``value`` safe to use inside a HomeAPI entry key.
-
-    HomeAPI resolves an entry by the last segment of the request path,
-    so keys must not contain slashes or whitespace.
-    """
-    allowed = []
-    for char in str(value):
-        if char.isalnum() or char in ('-', '_', '.'):
-            allowed.append(char)
-        else:
-            allowed.append('_')
-
-    return ''.join(allowed)
-
-
-class HomeAPIClient():
-    """Minimal client for the HomeAPI entries endpoint."""
-
-    def __init__(self, base_url, category, timeout=DEFAULT_HTTP_TIMEOUT,
-                 session=None):
-        """Initialize the client for the given HomeAPI base url."""
-        self.base_url = base_url.rstrip('/')
-        self.category = category
-        self.timeout = timeout
-        self.session = session if session is not None else requests.Session()
-
-    def health(self):
-        """Return True if the HomeAPI server answers its health check."""
-        try:
-            result = self.session.get(
-                self.base_url + '/api/health', timeout=self.timeout)
-        except RequestException as error:
-            LOGGER.warning('HomeAPI health check failed: %s', error)
-            return False
-
-        return result.status_code == 200
-
-    def create(self, key, value):
-        """Create an entry, return True on success."""
-        try:
-            result = self.session.post(
-                self.base_url + '/api/entries',
-                json={
-                    'category': self.category,
-                    'key': key,
-                    'value': value,
-                },
-                timeout=self.timeout,
-            )
-        except RequestException as error:
-            LOGGER.warning('HomeAPI create failed for %s: %s', key, error)
-            return False
-
-        if result.status_code == 201:
-            return True
-
-        LOGGER.warning('HomeAPI create for %s returned %s: %s',
-                       key, result.status_code, _body(result))
-        return False
-
-    def update(self, key, value):
-        """Update an entry, return True on success, None if not found."""
-        try:
-            result = self.session.put(
-                self.base_url + '/api/entries/' + key,
-                json={'value': value},
-                timeout=self.timeout,
-            )
-        except RequestException as error:
-            LOGGER.warning('HomeAPI update failed for %s: %s', key, error)
-            return False
-
-        if result.status_code == 200:
-            return True
-
-        if result.status_code == 404:
-            return None
-
-        LOGGER.warning('HomeAPI update for %s returned %s: %s',
-                       key, result.status_code, _body(result))
-        return False
-
-    def upsert(self, key, value):
-        """Update an entry, creating it first time round."""
-        updated = self.update(key, value)
-
-        if updated is not None:
-            return updated
-
-        LOGGER.info('Creating HomeAPI entry %s/%s', self.category, key)
-        return self.create(key, value)
-
-
-def _body(result):
-    """Return a short, printable version of a response body."""
-    try:
-        return json.dumps(result.json())[:200]
-    except ValueError:
-        return result.text[:200]
 
 
 def _iso_utc(timestamp):
@@ -325,14 +197,14 @@ class Publisher():
         return [device for device in devices
                 if device.dsn == self.config.device]
 
-    def entry_key(self, device, timestamp):
-        """Return the HomeAPI entry key for a device reading."""
-        key = '%s_%s' % (self.config.key_prefix, device.dsn)
+    def latest_key(self, device):
+        """Return the HomeAPI key of the always current entry."""
+        return sanitize_key('%s_%s' % (self.config.key_prefix, device.dsn))
 
-        if self.config.mode == 'history':
-            key = '%s_%d' % (key, int(timestamp))
-
-        return sanitize_key(key)
+    def history_key(self, device, timestamp):
+        """Return the HomeAPI key of one historic reading."""
+        return sanitize_key('%s_%s_%d' % (self.config.key_prefix,
+                                          device.dsn, int(timestamp)))
 
     def publish(self, device, timestamp=None):
         """Publish the reading of one device, True on success."""
@@ -340,12 +212,18 @@ class Publisher():
             timestamp = time.time()
 
         payload = build_payload(device, self.config.attributes, timestamp)
-        key = self.entry_key(device, timestamp)
+        results = []
 
-        if self.config.mode == 'history':
-            return self.client.create(key, payload)
+        if self.config.mode in ('latest', 'both'):
+            results.append(
+                self.client.upsert(self.latest_key(device), payload))
 
-        return self.client.upsert(key, payload)
+        if self.config.mode in ('history', 'both'):
+            results.append(
+                self.client.create(self.history_key(device, timestamp),
+                                   payload))
+
+        return all(results)
 
     def poll_once(self):
         """Run a single poll and publish cycle over all devices."""
@@ -411,15 +289,6 @@ class Publisher():
                 time.sleep(wait)
 
         return cycles
-
-
-def setup_logging(level):
-    """Configure logging for journald consumption."""
-    logging.basicConfig(
-        stream=sys.stdout,
-        format='%(levelname)s %(message)s',
-        level=getattr(logging, level, logging.INFO),
-    )
 
 
 def _interruptible_sleep(seconds, publisher):
